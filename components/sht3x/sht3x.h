@@ -43,19 +43,48 @@
  
 #ifndef __SHT3x_H__
 #define __SHT3x_H__
-
+#endif
 // Uncomment to enable debug output
 // #define SHT3x_DEBUG_LEVEL_1     // only error messages
 // #define SHT3x_DEBUG_LEVEL_2     // error and debug messages
 
-#include "stdint.h"
-#include "stdbool.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
-#include "sht3x_platform.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_err.h"
+
+#include "driver/i2c.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define I2C_SHT3X_MASTER_SCL_IO             2                /*!< gpio number for I2C master clock */
+#define I2C_SHT3X_MASTER_SDA_IO             14               /*!< gpio number for I2C master data  */
+#define I2C_SHT3X_MASTER_NUM                I2C_NUM_0        /*!< I2C port number for master dev */
+#define I2C_SHT3X_MASTER_TX_BUF_DISABLE     0                /*!< I2C master do not need buffer */
+#define I2C_SHT3X_MASTER_RX_BUF_DISABLE     0                /*!< I2C master do not need buffer */
+
+#define SHT3X_SENSOR_ADDR                   0x44             /*!< slave address for SHT3X sensor */
+#define SHT3X_CMD_START                     0x41             /*!< Command to set measure mode */
+#define SHT3X_WHO_AM_I                      0x75             /*!< Command to read WHO_AM_I reg */
+#define WRITE_BIT                           I2C_MASTER_WRITE /*!< I2C master write */
+#define READ_BIT                            I2C_MASTER_READ  /*!< I2C master read */
+#define ACK_CHECK_EN                        0x1              /*!< I2C master will check ack from slave*/
+#define ACK_CHECK_DIS                       0x0              /*!< I2C master will not check ack from slave */
+#define ACK_VAL                             0x0              /*!< I2C ack value */
+#define NACK_VAL                            0x1              /*!< I2C nack value */
+#define LAST_NACK_VAL                       0x2              /*!< I2C last_nack value */
+
+// Generator polynomial for CRC
+#define POLYNOMIAL  0x131 // P(x) = x^8 + x^5 + x^4 + 1 = 100110001
 
 // definition of possible I2C slave addresses
 #define SHT3x_ADDR_1 0x44        // ADDR pin connected to GND/VSS (default)
@@ -88,6 +117,48 @@ extern "C" {
 #define SHT3x_WRONG_CRC_HUMIDITY     (10 << 8)
 
 #define SHT3x_RAW_DATA_SIZE 6
+
+//-- Enumerations -------------------------------------------------------------
+// Sensor Commands
+typedef enum{
+  CMD_READ_SERIALNBR  = 0x3780, // read serial number
+  CMD_READ_STATUS     = 0xF32D, // read status register
+  CMD_CLEAR_STATUS    = 0x3041, // clear status register
+  CMD_HEATER_ENABLE   = 0x306D, // enabled heater
+  CMD_HEATER_DISABLE  = 0x3066, // disable heater
+  CMD_SOFT_RESET      = 0x30A2, // soft reset
+  CMD_MEAS_CLOCKSTR_H = 0x2C06, // measurement: clock stretching, high repeatability
+  CMD_MEAS_CLOCKSTR_M = 0x2C0D, // measurement: clock stretching, medium repeatability
+  CMD_MEAS_CLOCKSTR_L = 0x2C10, // measurement: clock stretching, low repeatability
+  CMD_MEAS_POLLING_H  = 0x2400, // measurement: polling, high repeatability
+  CMD_MEAS_POLLING_M  = 0x240B, // measurement: polling, medium repeatability
+  CMD_MEAS_POLLING_L  = 0x2416, // measurement: polling, low repeatability
+  CMD_MEAS_PERI_05_H  = 0x2032, // measurement: periodic 0.5 mps, high repeatability
+  CMD_MEAS_PERI_05_M  = 0x2024, // measurement: periodic 0.5 mps, medium repeatability
+  CMD_MEAS_PERI_05_L  = 0x202F, // measurement: periodic 0.5 mps, low repeatability
+  CMD_MEAS_PERI_1_H   = 0x2130, // measurement: periodic 1 mps, high repeatability
+  CMD_MEAS_PERI_1_M   = 0x2126, // measurement: periodic 1 mps, medium repeatability
+  CMD_MEAS_PERI_1_L   = 0x212D, // measurement: periodic 1 mps, low repeatability
+  CMD_MEAS_PERI_2_H   = 0x2236, // measurement: periodic 2 mps, high repeatability
+  CMD_MEAS_PERI_2_M   = 0x2220, // measurement: periodic 2 mps, medium repeatability
+  CMD_MEAS_PERI_2_L   = 0x222B, // measurement: periodic 2 mps, low repeatability
+  CMD_MEAS_PERI_4_H   = 0x2334, // measurement: periodic 4 mps, high repeatability
+  CMD_MEAS_PERI_4_M   = 0x2322, // measurement: periodic 4 mps, medium repeatability
+  CMD_MEAS_PERI_4_L   = 0x2329, // measurement: periodic 4 mps, low repeatability
+  CMD_MEAS_PERI_10_H  = 0x2737, // measurement: periodic 10 mps, high repeatability
+  CMD_MEAS_PERI_10_M  = 0x2721, // measurement: periodic 10 mps, medium repeatability
+  CMD_MEAS_PERI_10_L  = 0x272A, // measurement: periodic 10 mps, low repeatability
+  CMD_FETCH_DATA      = 0xE000, // readout measurements for periodic mode
+  CMD_R_AL_LIM_LS     = 0xE102, // read alert limits, low set
+  CMD_R_AL_LIM_LC     = 0xE109, // read alert limits, low clear
+  CMD_R_AL_LIM_HS     = 0xE11F, // read alert limits, high set
+  CMD_R_AL_LIM_HC     = 0xE114, // read alert limits, high clear
+  CMD_W_AL_LIM_HS     = 0x611D, // write alert limits, high set
+  CMD_W_AL_LIM_HC     = 0x6116, // write alert limits, high clear
+  CMD_W_AL_LIM_LC     = 0x610B, // write alert limits, low clear
+  CMD_W_AL_LIM_LS     = 0x6100, // write alert limits, low set
+  CMD_NO_SLEEP        = 0x303E,
+}etCommands;
 
 /**
  * @brief	raw data type
@@ -272,9 +343,7 @@ bool sht3x_compute_values (sht3x_raw_data_t raw_data,
 bool sht3x_get_results (sht3x_sensor_t* dev, 
                         float* temperature, float* humidity);
 
-
+void I2C_SHT3x_Task(void *arg);
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* __SHT3x_H__ */

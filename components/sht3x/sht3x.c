@@ -41,382 +41,323 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <string.h>
-#include <stdlib.h>
-
 #include "sht3x.h"
 
-#define SHT3x_STATUS_CMD               0xF32D
-#define SHT3x_CLEAR_STATUS_CMD         0x3041
-#define SHT3x_RESET_CMD                0x30A2
-#define SHT3x_FETCH_DATA_CMD           0xE000
-#define SHT3x_HEATER_OFF_CMD           0x3066
+static const char *TAG = "SHT3x";
 
-const uint16_t SHT3x_MEASURE_CMD[6][3] = { 
-        {0x2400,0x240b,0x2416},    // [SINGLE_SHOT][H,M,L] without clock stretching
-        {0x2032,0x2024,0x202f},    // [PERIODIC_05][H,M,L]
-        {0x2130,0x2126,0x212d},    // [PERIODIC_1 ][H,M,L]
-        {0x2236,0x2220,0x222b},    // [PERIODIC_2 ][H,M,L]
-        {0x2234,0x2322,0x2329},    // [PERIODIC_4 ][H,M,L]
-        {0x2737,0x2721,0x272a} };  // [PERIODIC_10][H,M,L]
-
-// due to the fact that ticks can be smaller than portTICK_PERIOD_MS, one and
-// a half tick period added to the duration to be sure that waiting time for 
-// the results is long enough
-#define TIME_TO_TICKS(ms) (1 + ((ms) + (portTICK_PERIOD_MS-1) + portTICK_PERIOD_MS/2 ) / portTICK_PERIOD_MS)
-
-#define SHT3x_MEAS_DURATION_REP_HIGH   15
-#define SHT3x_MEAS_DURATION_REP_MEDIUM 6
-#define SHT3x_MEAS_DURATION_REP_LOW    4
-
-// measurement durations in us 
-const uint16_t SHT3x_MEAS_DURATION_US[3] = { SHT3x_MEAS_DURATION_REP_HIGH   * 1000, 
-                                             SHT3x_MEAS_DURATION_REP_MEDIUM * 1000, 
-                                             SHT3x_MEAS_DURATION_REP_LOW    * 1000 };
-
-// measurement durations in RTOS ticks
-const uint8_t SHT3x_MEAS_DURATION_TICKS[3] = { TIME_TO_TICKS(SHT3x_MEAS_DURATION_REP_HIGH), 
-                                               TIME_TO_TICKS(SHT3x_MEAS_DURATION_REP_MEDIUM), 
-                                               TIME_TO_TICKS(SHT3x_MEAS_DURATION_REP_LOW) };
-
-#if defined(SHT3x_DEBUG_LEVEL_2)
-#define debug(s, f, ...) printf("%s %s: " s "\n", "SHT3x", f, ## __VA_ARGS__)
-#define debug_dev(s, f, d, ...) printf("%s %s: bus %d, addr %02x - " s "\n", "SHT3x", f, d->bus, d->addr, ## __VA_ARGS__)
-#else
-#define debug(s, f, ...)
-#define debug_dev(s, f, d, ...)
-#endif
-
-#if defined(SHT3x_DEBUG_LEVEL_1) || defined(SHT3x_DEBUG_LEVEL_2)
-#define error(s, f, ...) printf("%s %s: " s "\n", "SHT3x", f, ## __VA_ARGS__)
-#define error_dev(s, f, d, ...) printf("%s %s: bus %d, addr %02x - " s "\n", "SHT3x", f, d->bus, d->addr, ## __VA_ARGS__)
-#else
-#define error(s, f, ...)
-#define error_dev(s, f, d, ...)
-#endif
-
-/** Forward declaration of function for internal use */
-
-static bool sht3x_is_measuring  (sht3x_sensor_t*);
-static bool sht3x_send_command  (sht3x_sensor_t*, uint16_t);
-static bool sht3x_read_data     (sht3x_sensor_t*, uint8_t*,  uint32_t);
-static bool sht3x_get_status    (sht3x_sensor_t*, uint16_t*);
-static bool sht3x_reset         (sht3x_sensor_t*);
-
-static uint8_t crc8 (uint8_t data[], int len);
-
-/** ------------------------------------------------ */
-
-bool sht3x_init_driver()
+static esp_err_t SHT3x_CheckCrc(uint8_t data[], uint8_t nbrOfBytes, uint8_t checksum);
+static float SHT3x_CalcTemperature(uint16_t rawValue);
+static float SHT3x_CalcHumidity(uint16_t rawValue);
+/**
+ * @brief i2c master initialization
+ */
+esp_err_t I2C_Init()
 {
-    return true;
+    int i2c_master_port = I2C_SHT3X_MASTER_NUM;
+    i2c_config_t conf;
+    conf.mode = I2C_MODE_MASTER;
+    conf.sda_io_num = I2C_SHT3X_MASTER_SDA_IO;
+    conf.sda_pullup_en = 0;
+    conf.scl_io_num = I2C_SHT3X_MASTER_SCL_IO;
+    conf.scl_pullup_en = 0;
+    ESP_ERROR_CHECK(i2c_driver_install(i2c_master_port, conf.mode));
+    ESP_ERROR_CHECK(i2c_param_config(i2c_master_port, &conf));
+    return ESP_OK;
 }
 
-
-sht3x_sensor_t* sht3x_init_sensor(uint8_t bus, uint8_t addr)
+/**
+ * @brief test code to write sht3x
+ *
+ * 1. send data
+ * ___________________________________________________________________________________________________
+ * | start | slave_addr + wr_bit + ack | write reg_address + ack | write data_len byte + ack  | stop |
+ * --------|---------------------------|-------------------------|----------------------------|------|
+ *
+ * @param I2C_SHT3X_MASTER_NUM I2C port number
+ * @param reg_address slave reg address
+ * @param data data to send
+ * @param data_len data length
+ *
+ * @return
+ *     - ESP_OK Success
+ *     - ESP_ERR_INVALID_ARG Parameter error
+ *     - ESP_FAIL Sending command error, slave doesn't ACK the transfer.
+ *     - ESP_ERR_INVALID_STATE I2C driver not installed or not in master mode.
+ *     - ESP_ERR_TIMEOUT Operation timeout because the bus is busy.
+ */
+esp_err_t I2C_SHT3x_Write(uint8_t reg_address, uint8_t *data, size_t data_len)
 {
-    sht3x_sensor_t* dev;
+    int ret;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, SHT3X_SENSOR_ADDR << 1 | WRITE_BIT, ACK_CHECK_EN);
+    i2c_master_write_byte(cmd, reg_address, ACK_CHECK_EN);
+    i2c_master_write(cmd, data, data_len, ACK_CHECK_EN);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_SHT3X_MASTER_NUM, cmd, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd);
 
-    if ((dev = malloc (sizeof(sht3x_sensor_t))) == NULL)
-        return NULL;
+    return ret;
+}
+/**
+ * @brief send command to sht3x
+ */
+esp_err_t I2C_SHT3x_WriteCommand(etCommands command)
+{
+    uint8_t cmd_data[2] = { command >> 8, command & 0xff };
     
-    // inititalize sensor data structure
-    dev->bus  = bus;
-    dev->addr = addr;
-    dev->mode = sht3x_single_shot;
-    dev->meas_start_time = 0;
-    dev->meas_started = false;
-    dev->meas_first = false;
+    esp_err_t ret;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, SHT3X_SENSOR_ADDR << 1 | WRITE_BIT, ACK_CHECK_EN);
+    i2c_master_write(cmd, cmd_data, 2, ACK_CHECK_EN);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_SHT3X_MASTER_NUM, cmd, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd);   
 
-    uint16_t status;
-
-    // try to reset the sensor
-    if (!sht3x_reset(dev))
+    if(ret == ESP_OK)
     {
-        debug_dev ("could not reset the sensor", __FUNCTION__, dev);
+       ESP_LOGI(TAG, "Command: 0x%0x Send OK.\n", command);
     }
-    
-    // check again the status after clear status command
-    if (!sht3x_get_status(dev, &status))
-    {
-        error_dev ("could not get sensor status", __FUNCTION__, dev);
-        free(dev);
-        return NULL;       
-    }
-    
-    debug_dev ("sensor initialized", __FUNCTION__, dev);
-    return dev;
+    return ret;
 }
-
-
-bool sht3x_measure (sht3x_sensor_t* dev, float* temperature, float* humidity)
+/**
+ * @brief test code to read sht3x
+ *
+ * 1. send reg address
+ * ______________________________________________________________________
+ * | start | slave_addr + wr_bit + ack | write reg_address + ack | stop |
+ * --------|---------------------------|-------------------------|------|
+ *
+ * 2. read data
+ * ___________________________________________________________________________________
+ * | start | slave_addr + wr_bit + ack | read data_len byte + ack(last nack)  | stop |
+ * --------|---------------------------|--------------------------------------|------|
+ *
+ * @param I2C_SHT3X_MASTER_NUM I2C port number
+ * @param reg_address slave reg address
+ * @param data data to read
+ * @param data_len data length
+ *
+ * @return
+ *     - ESP_OK Success
+ *     - ESP_ERR_INVALID_ARG Parameter error
+ *     - ESP_FAIL Sending command error, slave doesn't ACK the transfer.
+ *     - ESP_ERR_INVALID_STATE I2C driver not installed or not in master mode.
+ *     - ESP_ERR_TIMEOUT Operation timeout because the bus is busy.
+ */
+esp_err_t I2C_SHT3x_Read(uint8_t reg_address, uint8_t *data, size_t data_len)
 {
-    if (!dev || (!temperature && !humidity)) return false;
+    int ret;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, SHT3X_SENSOR_ADDR << 1 | WRITE_BIT, ACK_CHECK_EN);
+    i2c_master_write_byte(cmd, reg_address, ACK_CHECK_EN);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_SHT3X_MASTER_NUM, cmd, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd);
 
-    if (!sht3x_start_measurement (dev, sht3x_single_shot, sht3x_high))
-        return false;
-
-    vTaskDelay (SHT3x_MEAS_DURATION_TICKS[sht3x_high]);
-
-    sht3x_raw_data_t raw_data;
-    
-    if (!sht3x_get_raw_data (dev, raw_data))
-        return false;
-        
-    return sht3x_compute_values (raw_data, temperature, humidity);
-}
-
-
-bool sht3x_start_measurement (sht3x_sensor_t* dev, sht3x_mode_t mode, sht3x_repeat_t repeat)
-{
-    if (!dev) return false;
-    
-    dev->error_code = SHT3x_OK;
-    dev->mode = mode;
-    dev->repeatability = repeat;
-    
-    // start measurement according to selected mode and return an duration estimate
-    if (!sht3x_send_command(dev, SHT3x_MEASURE_CMD[mode][repeat]))
-    {
-        error_dev ("could not send start measurment command", __FUNCTION__, dev);
-        dev->error_code |= SHT3x_SEND_MEAS_CMD_FAILED;
-        return false;
+    if (ret != ESP_OK) {
+        return ret;
     }
 
-    dev->meas_start_time = sdk_system_get_time ();
-    dev->meas_started = true;
-    dev->meas_first = true;
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, SHT3X_SENSOR_ADDR << 1 | READ_BIT, ACK_CHECK_EN);
+    i2c_master_read(cmd, data, data_len, LAST_NACK_VAL);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_SHT3X_MASTER_NUM, cmd, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd);
 
-    return true;
+    return ret;
 }
-
-
-uint8_t sht3x_get_measurement_duration (sht3x_repeat_t repeat)
+esp_err_t I2C_SHT3x_Read2BytesAndCrc(uint16_t *data1, uint16_t *data2)
 {
-    return SHT3x_MEAS_DURATION_TICKS[repeat];  // in RTOS ticks
-}
+    int ret;
+    uint8_t bytes[6];
+    uint8_t crcdata1[2], crcdata2[2];
+    uint8_t checksum1, checksum2;
 
-
-bool sht3x_get_raw_data(sht3x_sensor_t* dev, sht3x_raw_data_t raw_data)
-{
-    if (!dev || !raw_data) return false;
-
-    dev->error_code = SHT3x_OK;
-
-    if (!dev->meas_started)
-    {
-        debug_dev ("measurement is not started", __FUNCTION__, dev);
-        dev->error_code = SHT3x_MEAS_NOT_STARTED;
-        return sht3x_is_measuring (dev);
-    }
-
-    if (sht3x_is_measuring(dev))
-    {
-        error_dev ("measurement is still running", __FUNCTION__, dev);
-        dev->error_code = SHT3x_MEAS_STILL_RUNNING;
-        return false;
-    }
-
-    // send fetch command in any periodic mode (mode > 0) before read raw data
-    if (dev->mode && !sht3x_send_command(dev, SHT3x_FETCH_DATA_CMD))
-    {
-        debug_dev ("send fetch command failed", __FUNCTION__, dev);
-        dev->error_code |= SHT3x_SEND_FETCH_CMD_FAILED;
-        return false;
-    }
-
-    // read raw data
-    if (!sht3x_read_data(dev, raw_data, sizeof(sht3x_raw_data_t)))
-    {
-        error_dev ("read raw data failed", __FUNCTION__, dev);
-        dev->error_code |= SHT3x_READ_RAW_DATA_FAILED;
-        return false;
-    }
-
-    // reset first measurement flag
-    dev->meas_first = false;
+    ESP_ERROR_CHECK(I2C_SHT3x_WriteCommand(CMD_MEAS_POLLING_H));
+    ESP_ERROR_CHECK(I2C_SHT3x_WriteCommand(CMD_FETCH_DATA));
+    ESP_ERROR_CHECK(I2C_SHT3x_Read(0, bytes, 6));
+    ESP_LOGI(TAG, "bytes[0]= 0x%0x, bytes[1]= 0x%0x, bytes[2]= 0x%0x\n", bytes[0], bytes[1], bytes[2]);
+    ESP_LOGI(TAG, "bytes[3]= 0x%0x, bytes[4]= 0x%0x, bytes[5]= 0x%0x\n", bytes[3], bytes[4], bytes[5]);
     
-    // reset measurement started flag in single shot mode
-    if (dev->mode == sht3x_single_shot)
-        dev->meas_started = false;
+    memcpy(crcdata1, bytes, 2);
+    checksum1 = bytes[2];
+    ESP_LOGI(TAG, "crcdata1[0]= 0x%0x, crcdata1[1]= 0x%0x, checksum1= 0x%0x\n", crcdata1[0], crcdata1[1], checksum1);
+    ret = SHT3x_CheckCrc(crcdata1, 2, checksum1);
+    *data1 = (crcdata1[0] << 8) | crcdata1[1];
+
+    memcpy(crcdata2, bytes+3, 2);
+    checksum2 = bytes[5];
+    ESP_LOGI(TAG, "crcdata2[0]= 0x%0x, crcdata2[1]= 0x%0x, checksum2= 0x%0x\n", crcdata2[0], crcdata2[1], checksum2);
+    ret = SHT3x_CheckCrc(crcdata2, 2, checksum2);
+    *data2 = (crcdata2[0] << 8) | crcdata2[1];
+
+    return ret;
+}
+esp_err_t I2C_SHT3x_ReadMeasurementBuffer(float *temperature, float *humidity)
+{
+    int ret;
+    uint16_t rawValueTemp;       //temperature raw value from sensor
+    uint16_t rawValueHumi;       //humidity raw value from sensor
+
+    uint8_t rawData[6];
+    uint8_t rawDataTemp[2], rawDataHumi[2];
+    uint8_t checksumTemp, checksumHumi;
+
+    ESP_ERROR_CHECK(I2C_SHT3x_WriteCommand(CMD_MEAS_POLLING_H));    
+    vTaskDelay(100 / portTICK_RATE_MS);
+    ESP_ERROR_CHECK(I2C_SHT3x_WriteCommand(CMD_FETCH_DATA));
+    vTaskDelay(100 / portTICK_RATE_MS);
+    ESP_ERROR_CHECK(I2C_SHT3x_Read(0, rawData, 6));
+
+    ESP_LOGI(TAG, "rawData[0]= 0x%0x, rawData[1]= 0x%0x, rawData[2]= 0x%0x\n", rawData[0], rawData[1], rawData[2]);
+    ESP_LOGI(TAG, "rawData[3]= 0x%0x, rawData[4]= 0x%0x, rawData[5]= 0x%0x\n", rawData[3], rawData[4], rawData[5]);
     
-    // check temperature crc
-    if (crc8(raw_data,2) != raw_data[2])
+    memcpy(rawDataTemp, rawData, 2);
+    checksumTemp = rawData[2];
+    ESP_LOGI(TAG, "rawDataTemp[0]= 0x%0x, rawDataTemp[1]= 0x%0x, checksumTemp= 0x%0x\n", rawDataTemp[0], rawDataTemp[1], checksumTemp);
+    ret = SHT3x_CheckCrc(rawDataTemp, 2, checksumTemp);
+    if(ret == ESP_OK)
     {
-        error_dev ("CRC check for temperature data failed", __FUNCTION__, dev);
-        dev->error_code |= SHT3x_WRONG_CRC_TEMPERATURE;
-        return false;
+    rawValueTemp = (rawDataTemp[0] << 8) | rawDataTemp[1];
+    ESP_LOGI(TAG, "rawValueTemp= 0x%0x\n", rawValueTemp);
+    *temperature = SHT3x_CalcTemperature(rawValueTemp);
     }
 
-    // check humidity crc
-    if (crc8(raw_data+3,2) != raw_data[5])
+    memcpy(rawDataHumi, rawData+3, 2);
+    checksumHumi = rawData[5];
+    ESP_LOGI(TAG, "rawDataHumi[0]= 0x%0x, rawDataHumi[1]= 0x%0x, checksumHumi= 0x%0x\n", rawDataHumi[0], rawDataHumi[1], checksumHumi);
+    ret = SHT3x_CheckCrc(rawDataHumi, 2, checksumHumi);
+    if(ret == ESP_OK)
     {
-        error_dev ("CRC check for humidity data failed", __FUNCTION__, dev);
-        dev->error_code |= SHT3x_WRONG_CRC_HUMIDITY;
-        return false;
+    rawValueHumi = (rawDataHumi[0] << 8) | rawDataHumi[1];
+    ESP_LOGI(TAG, "rawValueHumi= 0x%0x\n", rawValueHumi);
+    *humidity = SHT3x_CalcHumidity(rawValueHumi);
     }
 
-    return true;
+    return ret;
 }
-
-
-bool sht3x_compute_values (sht3x_raw_data_t raw_data, float* temperature, float* humidity)
+static uint8_t SHT3x_CalcCrc(uint8_t data[], uint8_t nbrOfBytes)
 {
-    if (!raw_data) return false;
+    uint8_t bit;        //bit mask
+    uint8_t crc = 0xFF; //calculated checksum
+    uint8_t bytectr;    //byte counter
 
-    if (temperature) 
-        *temperature = ((((raw_data[0] * 256.0) + raw_data[1]) * 175) / 65535.0) - 45;
-
-    if (humidity)
-        *humidity = ((((raw_data[3] * 256.0) + raw_data[4]) * 100) / 65535.0);
-  
-    return true;    
-}
-
-
-bool sht3x_get_results (sht3x_sensor_t* dev, float* temperature, float* humidity)
-{
-    if (!dev || (!temperature && !humidity)) return false;
-
-    sht3x_raw_data_t raw_data;
-    
-    if (!sht3x_get_raw_data (dev, raw_data))
-        return false;
-        
-    return sht3x_compute_values (raw_data, temperature, humidity);
-}
-
-/* Functions for internal use only */
-
-static bool sht3x_is_measuring (sht3x_sensor_t* dev)
-{
-    if (!dev) return false;
-
-    dev->error_code = SHT3x_OK;
-
-    // not running if measurement is not started at all or 
-    // it is not the first measurement in periodic mode
-    if (!dev->meas_started || !dev->meas_first)
-      return false;
-    
-    // not running if time elapsed is greater than duration
-    uint32_t elapsed = sdk_system_get_time() - dev->meas_start_time;
-
-    return elapsed < SHT3x_MEAS_DURATION_US[dev->repeatability];
-}
-
-
-static bool sht3x_send_command(sht3x_sensor_t* dev, uint16_t cmd)
-{
-    if (!dev) return false;
-
-    uint8_t data[2] = { cmd >> 8, cmd & 0xff };
-
-    debug_dev ("send command MSB=%02x LSB=%02x", __FUNCTION__, dev, data[0], data[1]);
-
-    int err = i2c_slave_write(dev->bus, dev->addr, 0, data, 2);
-  
-    if (err)
+    //calculates 8-Bit checksum with given polynomial
+    for(bytectr = 0; bytectr < nbrOfBytes; bytectr++)
     {
-        dev->error_code |= (err == -EBUSY) ? SHT3x_I2C_BUSY : SHT3x_I2C_SEND_CMD_FAILED;
-        error_dev ("i2c error %d on write command %02x", __FUNCTION__, dev, err, cmd);
-        return false;
-    }
-
-    return true;
-}
-
-static bool sht3x_read_data(sht3x_sensor_t* dev, uint8_t *data,  uint32_t len)
-{
-    if (!dev) return false;
-    int err = i2c_slave_read(dev->bus, dev->addr, 0, data, len);
-        
-    if (err)
-    {
-        dev->error_code |= (err == -EBUSY) ? SHT3x_I2C_BUSY : SHT3x_I2C_READ_FAILED;
-        error_dev ("error %d on read %d byte", __FUNCTION__, dev, err, len);
-        return false;
-    }
-
-#   ifdef SHT3x_DEBUG_LEVEL_2
-    printf("SHT3x %s: bus %d, addr %02x - read following bytes: ", 
-           __FUNCTION__, dev->bus, dev->addr);
-    for (int i=0; i < len; i++)
-        printf("%02x ", data[i]);
-    printf("\n");
-#   endif // ifdef SHT3x_DEBUG_LEVEL_2
-
-    return true;
-}
-
-
-static bool sht3x_reset (sht3x_sensor_t* dev)
-{
-    if (!dev) return false;
-
-    debug_dev ("soft-reset triggered", __FUNCTION__, dev);
-    
-    dev->error_code = SHT3x_OK;
-
-    // send reset command
-    if (!sht3x_send_command(dev, SHT3x_RESET_CMD))
-    {
-        dev->error_code |= SHT3x_SEND_RESET_CMD_FAILED;
-        return false;
-    }   
-    // wait for small amount of time needed (according to datasheet 0.5ms)
-    vTaskDelay (100 / portTICK_PERIOD_MS);
-    
-    uint16_t status;
-
-    // check the status after reset
-    if (!sht3x_get_status(dev, &status))
-        return false;
-        
-    return true;    
-}
-
-
-static bool sht3x_get_status (sht3x_sensor_t* dev, uint16_t* status)
-{
-    if (!dev || !status) return false;
-
-    dev->error_code = SHT3x_OK;
-
-    uint8_t  data[3];
-
-    if (!sht3x_send_command(dev, SHT3x_STATUS_CMD) || !sht3x_read_data(dev, data, 3))
-    {
-        dev->error_code |= SHT3x_SEND_STATUS_CMD_FAILED;
-        return false;
-    }
-
-    *status = data[0] << 8 | data[1];
-    debug_dev ("status=%02x", __FUNCTION__, dev, *status);
-    return true;
-}
-
-
-const uint8_t g_polynom = 0x31;
-
-static uint8_t crc8 (uint8_t data[], int len)
-{
-    // initialization value
-    uint8_t crc = 0xff;
-    
-    // iterate over all bytes
-    for (int i=0; i < len; i++)
-    {
-        crc ^= data[i];  
-    
-        for (int i = 0; i < 8; i++)
+        crc ^= (data[bytectr]);
+        for(bit = 8; bit > 0; --bit)
         {
-            bool xor = crc & 0x80;
-            crc = crc << 1;
-            crc = xor ? crc ^ g_polynom : crc;
+            if(crc & 0x80) crc = (crc << 1) ^ POLYNOMIAL;
+            else           crc = (crc << 1);
         }
     }
-
     return crc;
-} 
+}
+static esp_err_t SHT3x_CheckCrc(uint8_t data[], uint8_t nbrOfBytes, uint8_t checksum)
+{
+    esp_err_t ret;
+    uint8_t crc;        //calculated checksum
 
+    //calculates 8-Bit checksum
+    crc = SHT3x_CalcCrc(data, nbrOfBytes);
+
+    //verify checksum
+    if(crc == checksum)
+    {
+        ESP_LOGI(TAG, "CRC OK.\n");
+        ret = ESP_OK;
+    } 
+    else
+    {
+        ESP_LOGI(TAG, "CRC FAILED.\n");
+        ret = ESP_FAIL;
+    }
+    return ret;
+}
+static float SHT3x_CalcTemperature(uint16_t rawValue)
+{
+    //calculate temperature
+    //T = -45 + 175 * rawValue /( 2 ^ 16 -1 )
+    return 175.0f * (float) rawValue / 65535.0f - 45.0f;
+}
+static float SHT3x_CalcHumidity(uint16_t rawValue)
+{
+    //calculate humidity
+    //RH = rawValue /(2^16-1) * 100
+
+    return 100.0f * (float) rawValue / 65535.0f;
+}
+esp_err_t I2C_SHT3x_Init()
+{
+    uint8_t cmd_data;
+    vTaskDelay(100 / portTICK_RATE_MS);
+    I2C_Init();
+    //clear status register
+    ESP_ERROR_CHECK(I2C_SHT3x_WriteCommand(CMD_CLEAR_STATUS));
+   //write "read serial number" command
+    // ESP_ERROR_CHECK(I2C_SHT3x_WriteCommand(I2C_SHT3X_MASTER_NUM, CMD_READ_SERIALNBR));
+    return ESP_OK;
+}
+esp_err_t SHT3x_ReadSerialNumber(uint32_t *SerialNumber)
+{
+    esp_err_t ret;
+    uint16_t SerialNumWords[2];
+    uint8_t data[6];
+    uint8_t data1[2];
+    uint8_t data2[2];
+    uint8_t checknum1;
+    uint8_t checknum2;
+    uint8_t crc;
+
+    ret = I2C_SHT3x_WriteCommand(CMD_READ_SERIALNBR);
+    ret = I2C_SHT3x_Read(0, data, 6);
+    ESP_LOGI(TAG, "data[0]= 0x%0x, data[1]= 0x%0x, data[2]= 0x%0x\n", data[0], data[1], data[2]);
+    ESP_LOGI(TAG, "data[3]= 0x%0x, data[4]= 0x%0x, data[5]= 0x%0x\n", data[3], data[4], data[5]);
+    memcpy(data1, data, 2);
+    checknum1 = data[2];
+    ESP_LOGI(TAG, "data1[0]= 0x%0x, data1[1]= 0x%0x, checknum1= 0x%0x\n", data1[0], data1[1], checknum1);
+    crc = SHT3x_CalcCrc(data1, 2);
+    ESP_LOGI(TAG, "CRC: 0x%0x\n", crc);
+    memcpy(data2, data+3, 2);
+    checknum2 = data[5];
+    ESP_LOGI(TAG, "data2[0]= 0x%0x, data2[1]= 0x%0x, checknum2= 0x%0x\n", data2[0], data2[1], checknum2);
+    crc = SHT3x_CalcCrc(data2, 2);
+    ESP_LOGI(TAG, "CRC: 0x%0x\n", crc);
+    //ret = I2C_SHT3x_Read2BytesAndCrc(&SerialNumWords[1], ACK_VAL);
+    // ret = I2C_SHT3x_Read2BytesAndCrc(&SerialNumWords[2], ACK_VAL);
+
+    // *SerialNumber = (SerialNumWords[0] << 16 | SerialNumWords[1]);
+    
+    return ret;
+}
+
+void I2C_SHT3x_Task(void *arg)
+{
+    // uint8_t data[3];
+    float temperature;
+    float humidity;
+    uint32_t SerialNumber;
+    I2C_SHT3x_Init();
+    // ESP_ERROR_CHECK(I2C_SHT3x_WriteCommand(CMD_MEAS_POLLING_H));
+    int ret;
+    while(1)
+    {
+    ret = I2C_SHT3x_ReadMeasurementBuffer(&temperature, &humidity);
+    // ESP_ERROR_CHECK(I2C_SHT3x_Read(I2C_SHT3X_MASTER_NUM, 0, data, 3));
+    // ESP_LOGI(TAG, "data[0]= 0x%0x, data[1]= 0x%0x, data[2]= 0x%0x\n", data[0], data[1], data[2]);
+    // ESP_ERROR_CHECK(SHT3x_ReadSerialNumber(&SerialNum));
+    if(ret == ESP_OK)
+        {
+            ESP_LOGI(TAG, "temperature= %d.%d, humidity= %d.%d\n", (uint16_t)temperature, (uint16_t)(temperature *100) %100,(uint16_t)humidity,(uint16_t)(humidity *100) %100);
+            // SerialNumber = (SerialNumWords[0] << 16 | SerialNumWords[1]);
+            // ESP_LOGI(TAG, "SerialNumber = 0x%0x\n", SerialNumber);
+        }
+    vTaskDelay(1000 / portTICK_RATE_MS);
+    }
+}
